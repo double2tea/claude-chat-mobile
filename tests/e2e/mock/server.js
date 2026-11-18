@@ -684,7 +684,19 @@ const mockFolderRelOk = rel => typeof rel === 'string' && !rel.startsWith('/') &
 // 场景抛错的账：registry 每个连接各建一份，所以记在模块级。/__reset 清空，E2E 收尾经 /__scenario-errors 断言为空。
 let mockScenarioErrors = [];
 
+let subagentFamilyArmed = false;
+let dropSubagentRelayAck = false;
+let reclaimSubagentBranch = false;
+let archivedSubagentBranch = null;
+const relayedItems = [];
+const subagentRelayReceipts = new Map();
 function resetMockState() {
+  subagentFamilyArmed = false;
+  dropSubagentRelayAck = false;
+  reclaimSubagentBranch = false;
+  archivedSubagentBranch = null;
+  relayedItems.length = 0;
+  subagentRelayReceipts.clear();
   mockResetGeneration += 1;
   resetAuthCooldown();
   mockApproveLog = [];
@@ -1030,6 +1042,12 @@ app.post('/__release-device-denial', (_req, res) => {
   res.json({ released: !!release });
 });
 
+app.post('/__arm-subagent-family', (req, res) => {
+  subagentFamilyArmed = true;
+  dropSubagentRelayAck = req.query.dropRelayAck === '1';
+  reclaimSubagentBranch = req.query.reclaimBranch === '1';
+  res.json({ ok: true });
+});
 app.post('/__reset', (_req, res) => {
   resetMockState();
   res.json({ ok: true });
@@ -1606,6 +1624,20 @@ function overflowOlderSessions(n) {
 }
 
 function mainCwdSessions() {
+  if (subagentFamilyArmed) {
+    const parentSessionId = 'mock-session-archived';
+    const agent = { agentId: 'sah-agent-1', agentType: 'Explore', description: '读取制作进度', toolUseId: 'sah-agent-1', spawnDepth: 1, finished: true };
+    const forkOrigin = { parentSessionId, agentId: agent.agentId, agentType: agent.agentType, description: agent.description };
+    const newBranches = mockInstances.filter(instance => instance.forkOrigin?.parentSessionId === parentSessionId).map(instance => ({
+      id: instance.sessionId, title: instance.title, lastUsedAt: mockListClockBase, forkOrigin,
+    }));
+    return [
+      ...newBranches,
+      { id: 'branch-recap', title: '确认原始任务', lastUsedAt: mockListClockBase, forkOrigin },
+      { id: 'branch-status', title: '核对工作进度', lastUsedAt: mockListClockBase - 6000, forkOrigin },
+      { id: parentSessionId, title: '子任务启动', lastUsedAt: mockListClockBase - 12000, subagents: [agent] }
+    ];
+  }
   const sessions = [
     {
       id: 'mock-session-visual-test',
@@ -2202,6 +2234,10 @@ io.on('connection', socket => {
         const rows = res?.sessions || [];
         const pinned = query ? [] : pinnedRowsFor(cwd, rows);
         const open = query ? [] : openRowsFor(cwd, [...rows, ...pinned]);
+        if (subagentFamilyArmed && query && cwd === '/Users/you/code/claude-chat-mobile') {
+          const ancestors = new Set(rows.map(row => row.forkOrigin?.parentSessionId));
+          open.push(...mainCwdSessions().filter(row => ancestors.has(row.id) && !rows.some(match => match.id === row.id)));
+        }
         const reply = { moreCount: 0, ...res, pinned, open, readState: readStateForRows([...rows, ...pinned, ...open], cwd) };
         if (cwd && cwd === sessionListHeldCwd) sessionListHeldAcks.push(() => rawCallback(reply));
         else rawCallback(reply);
@@ -2430,6 +2466,14 @@ io.on('connection', socket => {
   function handleSessionSwitch(payload, callback) {
     const { sessionId, cwd } = payload || {};
     console.log(`[mock] session:switch sessionId=${sessionId}, cwd=${cwd}`);
+    if (archivedSubagentBranch && archivedSubagentBranch.sessionId === sessionId && archivedSubagentBranch.cwd === cwd) {
+      const restored = { ...archivedSubagentBranch, instanceId: 'inst_branch_restored' };
+      archivedSubagentBranch = null;
+      mockInstances.push(restored);
+      viewingInstanceId = restored.instanceId;
+      broadcastMockInstances();
+      return callback?.({ ok: true, sessionId, instanceId: restored.instanceId });
+    }
     const knownArchived = {
       // P0-DESTROY-6b：server 重启摧毁 inst_1 后，「继续此会话」按钮走 session:switch 重开原会话
       // （真 server 语义 = 从磁盘 transcript 懒 resume，得到新实例；mock 复用同 id 够验前端链路）。
@@ -6708,6 +6752,19 @@ io.on('connection', socket => {
 
   // Handle custom trigger command inputs
   socket.on('user:message', async (payload, ack) => {
+    if (reclaimSubagentBranch && payload?.sessionId?.startsWith('session_branch_')) {
+      const index = mockInstances.findIndex(instance => instance.instanceId === payload.instanceId);
+      if (index !== -1) {
+        reclaimSubagentBranch = false;
+        [archivedSubagentBranch] = mockInstances.splice(index, 1);
+        viewingInstanceId = mockInstances[0].instanceId;
+        broadcastMockInstances();
+        return ack?.({ ok: false, error: 'stale_instance', stale: true });
+      }
+    }
+    if (archivedSubagentBranch && archivedSubagentBranch.sessionId === payload?.sessionId) {
+      return ack?.({ ok: false, error: 'stale_instance', stale: true });
+    }
     // P0-RESUME-DIV：续接分叉的发送闸，镜像真 server 的 gateResumeDivergence（app/src/sessions/resume-anchor.js；
     // mock 不 import app/src，wire 形状由集成层守，见 docs/testing.md「平行实现」）。位置同真 server：排在在途轮拒收之前。
     // 确认必须是【这一段】的 newestUuid——前端把确认送错（布尔、旧 uuid），这里照样拒，面板会再弹一次。
@@ -7181,25 +7238,84 @@ io.on('connection', socket => {
   });
 
   // 工具全文展开（对齐 server tool:full）：mock 对已知 toolUseId 返回全文
+
   // 子代理执行流水的按需拉取（历史侧展开卡片时触发）。真 server 走 readSubagentFlow 读
   // <sessionId>/subagents/agent-*.jsonl；这里给等价形状的 fixture。
   // items 的形状与 session:history 的消息同构（text 条目不带 kind，工具类才带）——真 server 那边
   // 是复用 expandHistoryEntry 得到的，mock 若漂了，前端"复用同一套渲染"的前提就假了。
-  socket.on('subagent:flow', ({ toolUseId } = {}, ack) => {
+  socket.on('subagent:flow', ({ toolUseId, agentId } = {}, ack) => {
     if (typeof ack !== 'function') return;
-    if (toolUseId !== 'sah-agent-1') return ack({ ok: false, reason: 'not_found' });
+    if ((agentId || toolUseId) !== 'sah-agent-1') return ack({ ok: false, reason: 'not_found' });
     return ack({
       ok: true,
-      agentType: 'code-reviewer',
-      description: 'Review auth module',
-      total: 3,
+      agentId: 'sah-agent-1',
+      agentType: subagentFamilyArmed ? 'Explore' : 'code-reviewer',
+      description: subagentFamilyArmed ? '读取制作进度' : 'Review auth module',
+      total: 3 + relayedItems.length,
       truncated: false,
       items: [
         { role: 'assistant', content: 'Scanning auth handlers for CSRF gaps…', timestamp: new Date(Date.now() - 8 * 60_000).toISOString(), isSidechain: true, parentToolUseId: 'sah-agent-1' },
         { kind: 'tool_use', role: 'assistant', toolUseId: 'sah-read-1', name: 'Read', inputSummary: '{"file_path":"app/src/auth.js"}', timestamp: new Date(Date.now() - 7 * 60_000).toISOString(), isSidechain: true, parentToolUseId: 'sah-agent-1' },
         { kind: 'tool_result', role: 'user', toolUseId: 'sah-read-1', ok: true, outputSummary: 'export function login() { /* ... */ }', timestamp: new Date(Date.now() - 7 * 60_000).toISOString(), isSidechain: true, parentToolUseId: 'sah-agent-1' },
+        ...relayedItems,
       ],
     });
+  });
+
+  // 子代理会话树（真 server 走 scanSubagentTree 扫 <sessionId>/subagents/）。
+  // 与 subagent:flow 同一份 fixture：一个 code-reviewer 子代理，toolUseId 也沿用 sah-agent-1，
+  // 前端据此把树与卡片对准同一个 agent。
+  socket.on('subagent:tree', ({ sessionId } = {}, ack) => {
+    if (typeof ack !== 'function') return;
+    if (sessionId !== 'mock-session-archived') return ack({ ok: true, subagents: [] });
+    return ack({
+      ok: true,
+      subagents: [{
+        agentId: 'sah-agent-1',
+        agentType: 'code-reviewer',
+        description: 'Review auth module',
+        name: null,
+        toolUseId: 'sah-agent-1',
+        spawnDepth: 1,
+        finished: true,
+        model: 'claude-3-5-sonnet',
+        messageCount: 3,
+        lastActivityMs: Date.now() - 7 * 60_000,
+      }],
+    });
+  });
+
+  // 「在子代理窗口单独聊天」：真 server 把子代理 transcript 转成独立会话再 resume，回 { ok, sessionId, instanceId }。
+  // mock 只需给等价形状，前端会拿 sessionId 去走既有的切换/历史链路。
+  socket.on('subagent:continue', ({ cwd, sessionId, agentId, text, clientMessageId } = {}, ack) => {
+    if (typeof ack !== 'function') return;
+    if (!subagentFamilyArmed || cwd !== '/Users/you/code/claude-chat-mobile' || sessionId !== 'mock-session-archived' || agentId !== 'sah-agent-1') {
+      return ack({ ok: false, error: '子代理归属不匹配' });
+    }
+    if (text === '模拟驾驶冲突') return ack({ ok: false, error: '无法取得主会话的驾驶权' });
+    if (clientMessageId && subagentRelayReceipts.has(clientMessageId)) return ack(subagentRelayReceipts.get(clientMessageId));
+    relayedItems.push({ role: 'user', content: text }, { role: 'assistant', content: `原子代理回复：${text}` });
+    const receipt = { ok: true, mode: 'parent_relay', sessionId, agentId };
+    if (clientMessageId) subagentRelayReceipts.set(clientMessageId, receipt);
+    if (dropSubagentRelayAck) {
+      dropSubagentRelayAck = false;
+      socket.conn.close();
+      return;
+    }
+    return ack(receipt);
+  });
+
+  socket.on('subagent:fork_chat', ({ sessionId, agentId } = {}, ack) => {
+    if (typeof ack !== 'function') return;
+    if (sessionId !== 'mock-session-archived' || agentId !== 'sah-agent-1') {
+      return ack({ ok: false, error: 'mock subagent not found' });
+    }
+    const instance = { ...createDefaultInstances()[0], instanceId: `inst_branch_${mockInstances.length}`,
+      sessionId: `session_branch_${mockInstances.length}`, title: '子代理独立分支', forkOrigin: { parentSessionId: sessionId, agentId } };
+    mockInstances.push(instance);
+    viewingInstanceId = instance.instanceId;
+    broadcastMockInstances();
+    return ack({ ok: true, cwd: instance.cwd, sessionId: instance.sessionId, instanceId: instance.instanceId });
   });
 
   socket.on('image:get', ({ ref, sessionId, cwd, instanceId } = {}, ack) => {

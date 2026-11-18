@@ -8,6 +8,7 @@ import { createSessionRecovery } from './session-recovery.js';
 // mirror/catchUp 同步引擎、openInstance 生命周期、契约路由共享同一组顶层可变状态
 // （viewing*/mirror*/catchUp*），拆开只会把耦合变成上下文对象穿针——有意保留为组装根本体。
 import { createServer } from 'node:http';
+import { setTimeout as delay } from 'node:timers/promises';
 import { createHash } from 'node:crypto';
 import { statSync, readFileSync, existsSync, mkdirSync, unlinkSync, accessSync, openSync, readSync, closeSync, realpathSync, constants as fsConstants } from 'node:fs';
 import { createConnection } from 'node:net';
@@ -27,9 +28,10 @@ import { AgentSession } from '../agent/agent.js';
 import { deleteSession as sdkDeleteSession, forkSession as sdkForkSession, renameSession as sdkRenameSession, resolveSettings as sdkResolveSettings } from '@anthropic-ai/claude-agent-sdk';
 import { resolveFreshPrefs, resolveResumeEffort, defaultsFromEffectiveSettings, defaultsFromResolvedSettings, permissionRulesFromEffectiveSettings, autoModeBlocked, normalizePermissionMode, normalizeEffortUiLevel, parseWorktreeCanonicalRoot, buildWorktreeGatewayEnv, countNeutralizableGatewayKeys, decideWorktreeSettingsAction } from '../agent/cli-settings-defaults.js';
 import * as sessions from '../sessions/sessions.js';
+import { observeSubagentRelay } from '../sessions/history.js';
 import * as readState from '../sessions/read-state.js';
 import * as folderOrder from '../sessions/folder-order.js';
-import { getSessionHistoryWithTotal, historyPage, externalHistoryExtent, readSubagentFlow, listSessionsPage, listSessionsByIds, sessionFileExists, sessionExistsInWorkspace, sessionFileMtime, getProjectDir, invalidateListCache, readLastPermissionMode, readLastAssistantModel, peekSessionListTitleTimed, classifyTranscriptTail, readTranscriptTailEntries, readLastCustomTitle, isSafeSessionId } from '../sessions/history.js';
+import { getSessionHistoryWithTotal, historyPage, externalHistoryExtent, readSubagentFlow, scanSubagentTree, forkSubagentSession, listSessionsPage, listSessionsByIds, sessionFileExists, sessionExistsInWorkspace, sessionFileMtime, getProjectDir, invalidateListCache, readLastPermissionMode, readLastAssistantModel, peekSessionListTitleTimed, classifyTranscriptTail, readTranscriptTailEntries, readLastCustomTitle, isSafeSessionId } from '../sessions/history.js';
 import { createSessionRenamer, sanitizeSessionTitle } from '../sessions/session-rename.js';
 import * as diagLog from '../agent/diag-log.js';
 import { notificationForEvent, notificationForCliHook, notificationForDeviceRequest, ntfyMetaFor, throttleNotify, clearNotifyPending, NOTIFY_CATEGORY, DEVICE_NOTIFY_KEY, DEVICE_NOTIFY_INTERVAL_MS, STALL_NOTIFY_INTERVAL_MS, isValidPushSubscription, hasForegroundApprovedClient, shouldNotifyBackgroundRunning, notificationForBackgroundRunning, notifyHasClientsAtSend } from '../ops/notifications.js';
@@ -94,6 +96,7 @@ import { listBranches, createSessionWorktree, worktreeNameFromMessage, inspectWo
 import { searchFiles } from '../files/file-search.js';
 import { isMissingInScope, isUnderVanishedRoot } from '../files/workdir-scope-guard.js';
 import { isProcessed, commitProcessed, processedInstanceId, isInFlight, claimInFlight, releaseInFlight } from '../agent/message-dedup.js';
+import { createSubagentRelayReceipts } from '../agent/subagent-relay.js';
 import {
   resolveInstanceTarget,
   shouldRejectOutboxLazyOpen,
@@ -300,6 +303,7 @@ let messageDedupState = new Map(); // clientMessageId → { at, instanceId }（R
 // 的第二个请求在第一个请求 commit 之前就跑到同一段代码，两边各自调一次 a.send() 真实重复发送。
 // 这里补一层"眼下有没有人正处理这条、尚未落定成败"的占用（见 message-dedup.js 的 isInFlight 一族）。
 let messageInFlightIds = new Set();
+const relaySubagent = createSubagentRelayReceipts();
 
 // ---- 通知发送通道（Web Push E15 + ntfy ②2b）：实现下沉至 ops/notify-channels.js ----
 // onDeliveryFailure 延迟绑定 scheduleBgBroadcast（定义在下方）——真失败时广播服务健康。
@@ -2971,7 +2975,7 @@ registerSocketConnection(io, socket => {
     scheduleStatusRefresh(); // 300ms 后新鲜数据跟上
   }
 
-  on(socket, 'user:message', async (payload, rawAck) => {
+  async function sendUserMessage(payload, rawAck) {
     const t0 = Date.now(); // Part C：端到端入队耗时，覆盖去重检查/校验/懒开会话/externalDirty 换实例/附件落盘全链路
     // REL-01 幂等（离线重发/网络抖动可能致同一条消息被处理两次）：clientMessageId 由发送端生成，
     // 已处理过的直接 ack 放行、不重复执行任何副作用（不重发校验提示、不重复调用 a.send）。
@@ -3322,7 +3326,8 @@ registerSocketConnection(io, socket => {
         messageInFlightIds = releaseInFlight(clientMessageId, messageInFlightIds);
       }
     }
-  });
+  }
+  on(socket, 'user:message', sendUserMessage);
 
   on(socket, 'user:approve', payload => {
     // op：客户端回传它渲染审批卡片时所见的 {tool,args,cwd}（端到端审批协议步骤5/6，
@@ -4457,10 +4462,24 @@ registerSocketConnection(io, socket => {
     const openIds = query ? [] : [...new Set([...agents.values()].map(a => a.sessionId))]
       .filter(sid => sid && !listedIds.has(sid) && !pendingDeleteIds.has(sid));
     const open = openIds.length ? await listSessionsByIds(cwd, openIds, { memberOptions }) : [];
+    const visibleIds = new Set([...listedIds, ...open.map(row => row.id)]);
+    let frontier = [...list, ...pinned, ...open];
+    while (frontier.length) {
+      const parentIds = new Set(frontier.map(row => row.forkOrigin?.parentSessionId)
+        .filter(parentId => parentId && !visibleIds.has(parentId) && !pendingDeleteIds.has(parentId)));
+      if (!parentIds.size) break;
+      for (const parentId of parentIds) visibleIds.add(parentId);
+      frontier = await listSessionsByIds(cwd, parentIds, { memberOptions });
+      open.push(...frontier);
+    }
     // 拼成一趟标注：annotateTerminalStates 每次都要读一遍终端注册表（可能还带尾窗读盘），分几次调用
     // 等于把这个成本翻倍，而几组行本来就同属一个 cwd、同一时刻的状态。标完按长度切回来——
     // applyTerminalStatesToSessions 只做等长克隆映射，顺序与入参一致。
     const terminal = await annotateTerminalStates(cwd, [...list, ...pinned, ...open]);
+    await Promise.all(terminal.list.map(async row => {
+      const subagents = await scanSubagentTree(row.id, row.cwd || cwd, { metadataOnly: true });
+      if (subagents.length) row.subagents = subagents;
+    }));
     const pageRows = terminal.list.slice(0, list.length);
     const pinnedRows = terminal.list.slice(list.length, list.length + pinned.length);
     const openRows = terminal.list.slice(list.length + pinned.length);
@@ -4772,7 +4791,7 @@ registerSocketConnection(io, socket => {
   // 【安全】同 tool:preview / tool:full 的范式：客户端只传 toolUseId，从不传路径——路径由
   // 服务端从 sessionId + cwd 自己算，且 readSubagentFlow 入口先过 isSafeSessionId（SS-003）。
   // 会话归属校验与 session:history 同款（按文件存在性裁决，接纳终端创建的会话）。
-  on(socket, 'subagent:flow', async ({ cwd: reqCwd, sessionId, toolUseId } = {}, ack) => {
+  on(socket, 'subagent:flow', async ({ cwd: reqCwd, sessionId, toolUseId, agentId } = {}, ack) => {
     if (typeof ack !== 'function') return;
     let cwd = routeCwd(reqCwd, { tier: 'read' });
     if (cwd === null) return ack({ ok: false, error: OUT_OF_SCOPE_ERROR });
@@ -4782,7 +4801,114 @@ registerSocketConnection(io, socket => {
     }
     cwd = location.cwd;
     try {
-      ack(await readSubagentFlow(sessionId, cwd, toolUseId));
+      ack(await readSubagentFlow(sessionId, cwd, toolUseId, { agentId }));
+    } catch (err) {
+      ack({ ok: false, error: err.message });
+    }
+  });
+
+  // 子代理会话树：一次给全「这个会话里有哪些子代理」。与 subagent:flow 分开是因为后者按需读正文
+  // （单文件可达 1.2MB），而列表只需要 meta + 消息数；合成一条会让每次打开会话都读全部正文。
+  // 安全模型同上：客户端只传 sessionId + cwd，路径由服务端算，入口过 isSafeSessionId。
+  on(socket, 'subagent:tree', async ({ cwd: reqCwd, sessionId } = {}, ack) => {
+    if (typeof ack !== 'function') return;
+    let cwd = routeCwd(reqCwd, { tier: 'read' });
+    if (cwd === null) return ack({ ok: false, error: OUT_OF_SCOPE_ERROR });
+    const location = await transcriptLocation(cwd, sessionId);
+    if (location.status !== 'found') {
+      return ack({ ok: false, error: locationError(location) });
+    }
+    cwd = location.cwd;
+    try {
+      ack({ ok: true, subagents: await scanSubagentTree(sessionId, cwd) });
+    } catch (err) {
+      ack({ ok: false, error: err.message });
+    }
+  });
+
+  on(socket, 'subagent:continue', async ({ cwd: reqCwd, sessionId, agentId, text, clientMessageId } = {}, ack) => {
+    if (typeof ack !== 'function') return;
+    if (!isSafeSessionId(sessionId) || !isSafeSessionId(agentId) || typeof text !== 'string' || !text.trim()
+      || typeof clientMessageId !== 'string' || !/^[\w-]{1,100}$/.test(clientMessageId)) {
+      return ack({ ok: false, error: '请选择原子代理并输入要发送的消息' });
+    }
+    const cwd = routeCwd(reqCwd);
+    if (cwd === null) return ack({ ok: false, error: OUT_OF_SCOPE_ERROR });
+    const location = await transcriptLocation(cwd, sessionId);
+    if (location.status !== 'found') return ack({ ok: false, error: locationError(location) });
+    const message = text.trim();
+    const id = 'subagent:' + createHash('sha256').update(JSON.stringify([location.cwd, sessionId, agentId, clientMessageId])).digest('hex');
+    const prompt = `Forward the following message verbatim to the existing subagent. Call SendMessage exactly once with this JSON as its arguments. Do not answer for the agent or create another agent. If the call fails, report the failure. Relay request: ${clientMessageId}.\n${JSON.stringify({ to: agentId, message })}`;
+    if (prompt.length > 50000) return ack({ ok: false, error: '消息过长' });
+    const unconfirmed = { ok: false, error: '主会话已接收转达，但尚未核实原子代理的答复。请先刷新记录，避免重复发送。' };
+    const result = await relaySubagent(id, message, {
+      start: async () => {
+        if (isProcessed(id, messageDedupState)) return { result: unconfirmed };
+        const states = await listTerminalSessionStatesOrNull();
+        const [owner] = applyTerminalStatesToSessions(location.cwd, [{ id: sessionId }], states);
+        if (!states || owner.terminal || owner.bgLocked) {
+          return { result: { ok: false, error: '无法取得主会话的驾驶权，请在当前驾驶端结束或移交会话后再试' } };
+        }
+        let observe;
+        try {
+          observe = await observeSubagentRelay(location.cwd, sessionId, agentId, message, { prompt });
+        } catch {
+          return { result: { ok: false, error: '无法读取原子代理的记录，请确认会话仍然存在' } };
+        }
+        const parent = instanceForSession(sessionId) || await dedupedResume(location.cwd, sessionId);
+        let sent;
+        try {
+          await sendUserMessage({ sessionId, instanceId: parent.instanceId, cwd: location.cwd, text: prompt, clientMessageId: id }, result => { sent = result; });
+        } catch (error) {
+          if (!isProcessed(id, messageDedupState)) throw error;
+        }
+        if (!sent?.ok && !isProcessed(id, messageDedupState)) {
+          return { result: { ok: false, error: sent?.error || '主会话无法接收转达' } };
+        }
+        return { observe };
+      },
+      confirm: async observe => {
+        const deadline = Date.now() + 90000;
+        do {
+          const evidence = await observe();
+          if (evidence.confirmed) return { result: { ok: true, mode: 'parent_relay', sessionId, agentId } };
+          if (evidence.failed) return { result: { ok: false, error: '主会话向原子代理转达失败，请查看主会话中的工具结果' } };
+          await delay(600);
+        } while (Date.now() < deadline);
+        return { result: unconfirmed, pending: true };
+      },
+    });
+    ack(result);
+  });
+
+  // 在子代理窗口单独聊天：把这个子代理的完整历史转成一份独立会话，再走常规 resume 打开它。
+  //
+  // 【为什么转写】CLI 的 resume 只认 projects/<slug>/<uuid>.jsonl，不认 subagents/ 下的文件；
+  // SDK 只提供 listSubagents / getSubagentMessages（只读），没有"向子代理发消息"的接口。
+  // 实测（claude 2.1.310 + 本地 mock API）：重建后的会话 resume 成功，模型收到子代理的 prompt 与结论原文。
+  // 目录判据与 session:fork 完全一致（无 tier 的 routeCwd + 树已删要拒）：两者都是"在某个工作区里
+  // 造一份新会话再打开"，对目录的要求不该分叉。它落的是 transcript，不属于任何会改代码的操作。
+  on(socket, 'subagent:fork_chat', async ({ cwd: reqCwd, sessionId, agentId } = {}, ack) => {
+    if (typeof ack !== 'function') return;
+    if (resolveGoneWorktreeParent(reqCwd, workDirs)) {
+      return ack({ ok: false, error: worktreeGoneError(reqCwd, '所以没法在这里单独聊天') });
+    }
+    let cwd = routeCwd(reqCwd);
+    if (cwd === null) return ack({ ok: false, error: OUT_OF_SCOPE_ERROR });
+    const location = await transcriptLocation(cwd, sessionId);
+    if (location.status !== 'found') {
+      return ack({ ok: false, error: locationError(location) });
+    }
+    cwd = location.cwd;
+    try {
+      const forked = await forkSubagentSession(sessionId, cwd, agentId);
+      if (!forked.ok) return ack(forked);
+      // 与 session:fork 同一条收尾：新会话要真的被打开，手机端才能直接在里面说话。
+      sessions.bumpGeneration(workspaceCwdOf(cwd));
+      const inst = await dedupedResume(cwd, forked.sessionId);
+      finishOpenFocus(inst, cwd, forked.sessionId, (opened) => {
+        ack({ ...forked, ...opened, ok: true });
+      });
     } catch (err) {
       ack({ ok: false, error: err.message });
     }

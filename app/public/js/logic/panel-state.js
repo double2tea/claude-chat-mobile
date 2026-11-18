@@ -363,6 +363,53 @@ export function mergeOrphanRowsByTime(sessions, orphans) {
   return out.concat(dated.slice(i));
 }
 
+// 子代理转写会话（forkOrigin，见服务端 history.js）不能和普通会话平铺在一起：它们是「主会话里某个
+// 子代理的延续」，在抽屉里单独成行会读成一条来源不明的新会话——实测症状就是一串
+// 「用一句话确认你仍记得原始任务」散落在列表里，看不出属于谁。
+// 这里按 parentSessionId 收成两层：父会话在列表里 → 子行挂到父行下面；父会话不在这一页
+// （被分页挤出 / 父会话已被删）→ 仍留在顶层，但保留 forkOrigin 让渲染层标出归属，不丢入口。
+export function groupSubagentForks(sessions = []) {
+  const byId = new Map(sessions.filter(s => s?.id).map(s => [s.id, s]));
+  const roots = [];
+  const children = new Map();
+  for (const s of sessions) {
+    const parentId = s?.forkOrigin?.parentSessionId;
+    if (!parentId || parentId === s?.id || !byId.has(parentId)) { roots.push(s); continue; }
+    const list = children.get(parentId) || [];
+    list.push(s);
+    children.set(parentId, list);
+  }
+  // 子行按时间降序：刚聊过的那个子代理排最前
+  for (const list of children.values()) list.sort((a, b) => (b.lastUsedAt ?? 0) - (a.lastUsedAt ?? 0));
+  // 父会话若排在它的转写会话后面，整棵树按最新活动提到前面。否则子会话先被画成顶层，
+  // 后面的父会话再单独成行，层级看起来仍是平的。
+  const activity = id => {
+    const own = byId.get(id)?.lastUsedAt ?? 0;
+    const kids = children.get(id) || [];
+    return Math.max(own, ...kids.map(row => row.lastUsedAt ?? 0));
+  };
+  roots.sort((a, b) => activity(b?.id) - activity(a?.id) || String(a?.id || "").localeCompare(String(b?.id || "")));
+  return { roots, children };
+}
+
+export function groupAgentContinuations(agents = [], forks, showAllAgents) {
+  const groups = new Map();
+  for (const agent of agents) {
+    groups.set(agent.agentId, { agent, hasTranscript: true, continuations: [] });
+  }
+  for (const fork of forks) {
+    const origin = fork.forkOrigin;
+    if (!groups.has(origin.agentId)) {
+      groups.set(origin.agentId, { agent: origin, hasTranscript: false, continuations: [] });
+    }
+    groups.get(origin.agentId).continuations.push(fork);
+  }
+  if (!showAllAgents) {
+    for (const [id, group] of groups) if (!group.continuations.length) groups.delete(id);
+  }
+  return groups;
+}
+
 // cwd 不在任何小节之下的活实例（例如刚进了仓库外的平级 worktree）：由抽屉单独成一节。
 export function unownedLiveInstances(instances, sectionKeys) {
   return (Array.isArray(instances) ? instances : [])
@@ -825,7 +872,10 @@ export function shouldRerenderSessionList({
   // terminal 进签名：CLI 进程 busy/alive 状态或副文本变化必须重渲，否则抽屉会陈旧。
   // terminalSource 同理：状态不变、驾驶方从终端换成桌面端时，chip 与副文本的措辞也得跟着换。
   const signature = list => (Array.isArray(list) ? list : [])
-    .map(s => `${s?.id || ''}:${(s?.title || '').slice(0, 40)}:${s?.lastUsedAt || ''}:${s?.terminal || ''}:${s?.terminalSource || ''}`)
+    .map(s => JSON.stringify([
+      s?.id, (s?.title || '').slice(0, 40), s?.lastUsedAt, s?.terminal, s?.terminalSource,
+      s?.forkOrigin, s?.subagents,
+    ]))
     .join('|');
   // pinned（手动标「稍后再看」、被 limit 挤出本页而单独补回的那组）必须单独进判据：它的成员来自
   // read-state 而不是这一页，主列表签名一个字都不变时它照样会增删——用户在另一台设备上标一条、

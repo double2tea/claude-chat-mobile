@@ -1,6 +1,7 @@
 // history.js —— 读取 CLI 会话历史用于前端展示（方案 2）
 // CLI 历史文件：~/.claude/projects/<project>/<session_id>.jsonl
-import { createHash } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
+import { mkdirSync } from 'node:fs';
 import { stat, readdir } from 'node:fs/promises';
 import { createInterface } from 'node:readline';
 import { basename, dirname, join } from 'node:path';
@@ -19,6 +20,7 @@ import { encodeProjectDir, projectDirDescendantPrefix } from '../shared/project-
 import { CLAUDE_PROJECTS_DIR } from '../shared/claude-home.js';
 // 本模块打开 ~/.claude/projects 下的文件一律走这两个：O_NONBLOCK 打开、只认普通文件，FIFO 不再卡死读盘线程。
 import { openRegularFile, readRegularText } from '../shared/regular-file.js';
+import { writeOwnerOnlyFile } from '../files/file-security.js';
 import { scanJsonl } from '../shared/jsonl-scan.js';
 
 // 快路径注入口（仅测试用）：测试替置一个函数后，快路径走替身而非真 SDK，便于无网络/无 CLI 环境下
@@ -1529,12 +1531,12 @@ async function scanSessionsViaSdk(cwd, limit) {
     try { st = await stat(file); } catch { return null; }
     let activityAt = null;
     try { activityAt = await readLastMessageActivityMs(file, st.size); } catch { /* 读失败 → 回落 lastModified */ }
-    // SDK 提不出 summary 时回落 readHeadMeta，与搜索、通知横幅同口径——否则搜得到原文、抽屉却是占位（验收 O58）。
-    // 只对空 summary 的那几条才开文件，正常会话不多付一次读。readHeadMeta 读失败返回 {}，落到占位。
-    const title = s.summary || (await readHeadMeta(file, st.size)).title || '(无标题)';
+    const meta = await cachedHeadMeta(file, st.size, st.mtimeMs);
+    const title = s.summary || meta.title || '(无标题)';
     return {
       id: s.sessionId,
       title,
+      ...(meta.forkOrigin ? { forkOrigin: meta.forkOrigin } : {}),
       lastUsedAt: Math.round(activityAt ?? s.lastModified),
     };
   }))).filter(Boolean);
@@ -1571,10 +1573,13 @@ async function scanSessionsViaSdk(cwd, limit) {
     const extra = await Promise.all(stats.slice(0, fetchLimit).map(async m => {
       const file = join(projectDir, m.name);
       const activityAt = await readLastMessageActivityMs(file, m.size).catch(() => null);
-      // 标题回落 readHeadMeta（与快路径空 summary 同口径）。本地 slash 命令跑完的会话主链无消息，提不出就是占位；
-      // 首条以 HTML 标签开头的会话 SDK 同样提不出 summary、整条漏报，但首条 user 文本在（验收 O58）。
-      const meta = await readHeadMeta(file, m.size);
-      return { id: m.name.slice(0, -6), title: meta.title || '(无标题)', lastUsedAt: Math.round(activityAt ?? m.mtimeMs) };
+      const meta = await cachedHeadMeta(file, m.size, m.mtimeMs);
+      return {
+        id: m.name.slice(0, -6),
+        title: meta.title || '(无标题)',
+        ...(meta.forkOrigin ? { forkOrigin: meta.forkOrigin } : {}),
+        lastUsedAt: Math.round(activityAt ?? m.mtimeMs),
+      };
     }));
     enriched.push(...extra);
   } catch { /* readdir 失败（目录刚被删等）：SDK 结果照常返回，不因补齐失败而整个列表塌掉 */ }
@@ -1685,11 +1690,12 @@ async function scanViaReaddir(dir, limit, query = '', titleById = new Map(), exc
       title,
       model: meta.model || null,
       entrypoint: meta.entrypoint || null,
+      ...(meta.forkOrigin ? { forkOrigin: meta.forkOrigin } : {}),
       lastUsedAt: Math.round(s.activityAt),
       _keys: query
         ? sessionTitleSearchKeys({
           summary: overlay,
-          customTitle: meta.customTitle,
+          customTitle: meta.forkOrigin ? meta.title : meta.customTitle,
           aiTitle: meta.aiTitle,
           firstUser: meta.firstUser,
           firstCmd: meta.firstCmd,
@@ -1775,9 +1781,12 @@ export async function listSessionsByIds(cwd, ids, { baseDir = CLAUDE_DIR, member
     ]);
     return {
       id,
-      title: peeked || (meta && meta.title) || '(无标题)',
+      // 转写会话的「标题」就是子代理描述，SDK summary 是那段任务书的摘录，会让父会话下面
+      // 挂出一串同款长句——有归属标记时以它为准。
+      title: peeked || meta.title || '(无标题)',
       model: (meta && meta.model) || null,
       entrypoint: (meta && meta.entrypoint) || null,
+      ...(meta.forkOrigin ? { forkOrigin: meta.forkOrigin } : {}),
       lastUsedAt: Math.round(activityAt ?? st.mtimeMs),
       // 与 listSessionsPage 的行同形：项目根的行不带 cwd，成员目录的行带——前端点开时要用真实 cwd
       ...(owner.member ? memberRowFields(owner.member) : {}),
@@ -1816,11 +1825,14 @@ async function cachedHeadMeta(file, size, mtimeMs) {
 }
 
 async function readHeadMeta(file, size) {
-  const meta = { title: '', model: null, entrypoint: null };
+  // forkOrigin：本仓把子代理流水转写成的独立会话（见 forkSubagentSession 写的 ccmSubagentFork）。
+  // 列表据此把它归到父会话下，而不是当成一条平级的普通会话——否则抽屉里会多出一串
+  // 看不出归属的「用一句话确认你仍记得原始任务」行。
+  const meta = { title: '', model: null, entrypoint: null, forkOrigin: null };
   // 标题优先级与 SDK summary 同口径：用户起的名（/rename、renameSession 写的 custom-title）> CLI 生成的
   // ai-title（与 /resume 选择器同款）> 首条真实 user 文本 > 首条斜杠命令名。
   // 命令包裹（<command-name>/clear</command-name>…）是 CLI 注入的 meta、非用户原话，不直接当标题。
-  let customTitle = '', aiTitle = '', firstUser = '', firstCmd = '';
+  let customTitle = '', aiTitle = '', firstUser = '', firstCmd = '', firstFollowUp = '';
   try {
     const { fh, st } = await openRegularFile(file);
     try {
@@ -1839,6 +1851,26 @@ async function readHeadMeta(file, size) {
         // entrypoint 全部被它抢先误判成 cli。
         if (!meta.entrypoint && entry.entrypoint && entry.type !== 'entrypoint-marker') meta.entrypoint = entry.entrypoint;
         if (!meta.model && entry.type === 'assistant' && entry.message?.model) meta.model = entry.message.model;
+        if (!meta.forkOrigin && entry.ccmSubagentFork) {
+          const src = entry.ccmSubagentFork;
+          if (src && typeof src === 'object'
+            && isSafeSessionId(src.parentSessionId)
+            && isSafeSessionId(src.agentId)) {
+            let agentType = typeof src.agentType === 'string' ? src.agentType : null;
+            let description = typeof src.description === 'string' ? src.description : null;
+            if (!agentType && !description) {
+              const subMeta = await readSubagentMeta(join(dirname(file), src.parentSessionId, 'subagents'), src.agentId);
+              if (subMeta?.agentType) agentType = subMeta.agentType;
+              if (subMeta?.description) description = subMeta.description;
+            }
+            meta.forkOrigin = {
+              parentSessionId: src.parentSessionId,
+              agentId: src.agentId,
+              agentType,
+              description,
+            };
+          }
+        }
         if (entry.type === 'custom-title' && typeof entry.customTitle === 'string' && entry.customTitle.trim()) {
           customTitle = entry.customTitle.trim(); // 后写者胜
         } else if (entry.type === 'ai-title' && typeof entry.aiTitle === 'string' && entry.aiTitle.trim()) {
@@ -1849,8 +1881,9 @@ async function readHeadMeta(file, size) {
             if (!firstCmd) { const m = /<command-name>([^<]+)<\/command-name>/.exec(c); if (m) firstCmd = m[1].trim(); }
           } else if (c.startsWith('<command-') || c.startsWith('<local-command-')) {
             /* 其他命令片段 / 本地命令 stdout/stderr 包裹：纯噪声，跳过 */
-          } else if (c && !firstUser) {
-            firstUser = c.slice(0, FIRST_USER_KEY_CHARS);
+          } else if (c) {
+            if (!firstUser) firstUser = c.slice(0, FIRST_USER_KEY_CHARS);
+            if (meta.forkOrigin && !entry.ccmSubagentFork && !firstFollowUp) firstFollowUp = c.slice(0, FIRST_USER_KEY_CHARS);
           }
         }
       }
@@ -1893,7 +1926,14 @@ async function readHeadMeta(file, size) {
   meta.aiTitle = aiTitle;
   meta.firstUser = firstUser;
   meta.firstCmd = firstCmd;
-  meta.title = (customTitle || aiTitle || firstUser || firstCmd).slice(0, 60);
+  // 转写会话的首条 user 就是子代理当初的 task prompt，直接拿它当标题会是整段任务书；
+  // 用子代理描述（没有就类型名）更像「这一条是什么」，父会话行旁边挂得住。
+  if (meta.forkOrigin) {
+    const label = meta.forkOrigin.description || meta.forkOrigin.agentType;
+    meta.title = (customTitle || aiTitle || firstFollowUp || label || firstUser || firstCmd).slice(0, 60);
+  } else {
+    meta.title = (customTitle || aiTitle || firstUser || firstCmd).slice(0, 60);
+  }
   return meta;
 }
 
@@ -2529,18 +2569,135 @@ export async function findSubagentByToolUseId(dir, wanted) {
   return null;
 }
 
-export async function readSubagentFlow(sessionId, cwd, toolUseId, { baseDir = CLAUDE_DIR, limit = 400 } = {}) {
+export async function readSubagentFlow(sessionId, cwd, toolUseId, { baseDir = CLAUDE_DIR, limit = 400, agentId = null } = {}) {
   if (!isSafeSessionId(sessionId)) return { ok: false, reason: 'bad_session' }; // SS-003 同口径：拼路径前先挡
-  const wanted = typeof toolUseId === 'string' ? toolUseId.trim() : '';
-  if (!wanted) return { ok: false, reason: 'bad_tool_use_id' };
   const dir = join(baseDir, getProjectDir(cwd), sessionId, 'subagents');
-  const hit = await findSubagentByToolUseId(dir, wanted);
-  if (hit === undefined) return { ok: false, reason: 'no_subagents' };
-  // 无 toolUseId 的 agent 存在（实证 179 个里 7 个：spawnDepth:2 的嵌套子代理，以及本地 slash
-  // 命令的顶层编排 agent），它们锚不到主链的任何一次 tool_use，本函数天然找不到——这是已知边界，
-  // 不是缺陷：没有锚点就没有可以挂载的卡片。
-  if (!hit) return { ok: false, reason: 'not_found' };
+  // 两条入口：按主链 toolUseId 反查（历史卡片），或直接按 agentId 打开（子代理列表/独立窗口）。
+  // agentId 走独立校验而不是复用 isSafeSessionId：它同样是拼路径的片段，字符集必须一样窄。
+  let hit;
+  if (agentId) {
+    const wantedAgent = typeof agentId === 'string' ? agentId.trim() : '';
+    if (!isSafeSessionId(wantedAgent)) return { ok: false, reason: 'bad_agent_id' };
+    // 判存在看 jsonl，不看 meta：实测有 meta 缺失但流水完好的 agent，按 meta 判会打不开它。
+    if (!(await subagentFlowExists(dir, wantedAgent))) return { ok: false, reason: 'not_found' };
+    const meta = await readSubagentMeta(dir, wantedAgent);
+    hit = { agentId: wantedAgent, agentType: meta?.agentType ?? null, description: meta?.description ?? null, meta };
+  } else {
+    const wanted = typeof toolUseId === 'string' ? toolUseId.trim() : '';
+    if (!wanted) return { ok: false, reason: 'bad_tool_use_id' };
+    hit = await findSubagentByToolUseId(dir, wanted);
+    if (hit === undefined) return { ok: false, reason: 'no_subagents' };
+    // 无 toolUseId 的 agent 存在（实证 179 个里 7 个：spawnDepth:2 的嵌套子代理，以及本地 slash
+    // 命令的顶层编排 agent），它们锚不到主链的任何一次 tool_use，本函数天然找不到——这是已知边界，
+    // 不是缺陷：没有锚点就没有可以挂载的卡片。
+    if (!hit) return { ok: false, reason: 'not_found' };
+  }
+  // 前端把每一条塞进对应的卡片/窗口，锚点优先用主链 tool_use id（有的话），否则用 agentId。
+  const anchor = (toolUseId && typeof toolUseId === 'string' && toolUseId.trim()) || hit.agentId;
+  const flow = await readSubagentFlowItems(dir, hit.agentId, anchor, limit);
+  if (!flow) return { ok: false, reason: 'read_failed' };
+  return {
+    ok: true,
+    agentId: hit.agentId,
+    agentType: hit.agentType,
+    description: hit.description,
+    model: hit.meta?.model ?? null,
+    finished: hit.meta?.finished ?? null,
+    items: flow.kept,
+    total: flow.total,
+    truncated: flow.total > flow.kept.length,
+  };
+}
 
+// 单个 agent 的 meta.json → 归一字段。返回 null = 文件缺失/损坏（调用方按"有但无描述"处理）。
+async function readSubagentMeta(dir, agentId) {
+  let meta;
+  try {
+    meta = JSON.parse(await readRegularText(join(dir, `agent-${agentId}.meta.json`)));
+  } catch {
+    return null;
+  }
+  if (!meta || typeof meta !== 'object') return null;
+  return {
+    agentType: typeof meta.agentType === 'string' ? meta.agentType : null,
+    description: typeof meta.description === 'string' ? meta.description : null,
+    name: typeof meta.name === 'string' ? meta.name : null,
+    toolUseId: typeof meta.toolUseId === 'string' ? meta.toolUseId : null,
+    spawnDepth: Number.isFinite(meta.spawnDepth) ? meta.spawnDepth : null,
+    finished: typeof meta.finished === 'boolean' ? meta.finished : null,
+    model: typeof meta.model === 'string' ? meta.model : null,
+  };
+}
+
+async function subagentFlowExists(dir, agentId) {
+  try {
+    return (await stat(join(dir, `agent-${agentId}.jsonl`))).isFile();
+  } catch {
+    return false;
+  }
+}
+
+function coordinatorMessage(entry) {
+  if (entry?.type !== 'user' || entry.origin?.kind !== 'coordinator') return null;
+  const content = extractContent(entry.message?.content);
+  const prefix = 'The coordinator sent a message while you were working:\n';
+  const suffix = '\n\nAddress this before completing your current task.';
+  return content.startsWith(prefix) && content.endsWith(suffix) ? content.slice(prefix.length, -suffix.length) : content;
+}
+
+export async function observeSubagentRelay(cwd, sessionId, agentId, text, { baseDir = CLAUDE_DIR, prompt } = {}) {
+  if (!isSafeSessionId(sessionId) || !isSafeSessionId(agentId)) throw new Error('子代理标识无效');
+  const project = join(baseDir, getProjectDir(cwd));
+  const parent = join(project, `${sessionId}.jsonl`);
+  const child = join(project, sessionId, 'subagents', `agent-${agentId}.jsonl`);
+  const cursors = await Promise.all([parent, child].map(async file => {
+    const { fh, st } = await openRegularFile(file);
+    await fh.close();
+    return st.size;
+  }));
+  let callId = null;
+  let gotReport = false;
+  let gotQuestion = false;
+  let gotAnswer = false;
+  let failed = false;
+  let relayTurn = !prompt;
+  const scanNew = async (file, index, visit) => {
+    const { fh, st } = await openRegularFile(file);
+    cursors[index] = await scanJsonl(fh, visit, { start: cursors[index], end: st.size });
+  };
+  return async () => {
+    await scanNew(parent, 0, entry => {
+      if (entry?.isSidechain) return;
+      const content = entry?.message?.content;
+      if (prompt && entry?.type === 'user' && entry.origin?.kind === 'human') {
+        relayTurn = extractContent(content) === prompt;
+      }
+      if (!callId && relayTurn && entry?.type === 'assistant' && Array.isArray(content)) {
+        for (const block of content) {
+          if (block.type === 'tool_use' && block.name === 'SendMessage'
+            && block.input?.to === agentId && block.input?.message === text) callId = block.id;
+        }
+      }
+      if (!callId || entry?.type !== 'user') return;
+      if (Array.isArray(content) && content.some(block =>
+        block?.type === 'tool_result' && block.tool_use_id === callId && block.is_error)) failed = true;
+      if (entry.origin?.kind !== 'task-notification' && entry.turnOrigin !== 'task_notification') return;
+      const notice = extractContent(content);
+      if (notice.includes(`<task-id>${agentId}</task-id>`) && notice.includes(`<tool-use-id>${callId}</tool-use-id>`)) {
+        if (notice.includes('<status>completed</status>')) gotReport = true;
+        else if (/<status>(?:failed|stopped)<\/status>/.test(notice)) failed = true;
+      }
+    });
+    await scanNew(child, 1, entry => {
+      if (coordinatorMessage(entry) === text) gotQuestion = true;
+      if (gotQuestion && entry?.type === 'assistant' && extractContent(entry.message?.content).trim()) gotAnswer = true;
+    });
+    return { confirmed: Boolean(callId && gotReport && gotQuestion && gotAnswer), failed, routed: Boolean(callId) };
+  };
+}
+
+// 读一个 agent 的完整流水并展开成与主历史同构的条目。返回 null = 读失败。
+async function readSubagentFlowItems(dir, agentId, anchor, limit) {
   const items = [];
   let total = 0;
   const toolNames = new Map(); // 同 getSessionHistory：tool_result 按工具名取摘要上限
@@ -2551,36 +2708,159 @@ export async function readSubagentFlow(sessionId, cwd, toolUseId, { baseDir = CL
   let input;
   try {
     // 流式逐行读：单文件可达 1.2MB，一次性 buffer 会在 always-on 进程里堆出峰值
-    input = (await openRegularFile(join(dir, `agent-${hit.agentId}.jsonl`))).fh.createReadStream({ encoding: 'utf-8' });
+    input = (await openRegularFile(join(dir, `agent-${agentId}.jsonl`))).fh.createReadStream({ encoding: 'utf-8' });
     const rl = createInterface({ input, crlfDelay: Infinity });
     for await (const line of rl) {
       if (!line.trim()) continue;
       let entry;
       try { entry = JSON.parse(line); } catch { continue; } // 末行可能是写入中途的半行
-      if (entry.isMeta) continue;
+      const relayed = coordinatorMessage(entry);
+      if (entry.isMeta && relayed === null) continue;
       if (entry.type !== 'user' && entry.type !== 'assistant') continue;
       // 与主历史同构：复用同一个展开器，前端才能拿同一套渲染跑两条路径。
-      // parentToolUseId 一律填这张卡的 id——本函数返回的每一条按定义都属于它。
-      const expanded = expandHistoryEntry(entry.message?.content, entry.message?.role || entry.type, entry.timestamp, {
+      // parentToolUseId 一律填这张卡/这个窗口的锚点——本函数返回的每一条按定义都属于它。
+      const expanded = expandHistoryEntry(relayed ?? entry.message?.content, entry.message?.role || entry.type, entry.timestamp, {
         toolNames,
         isSidechain: true,
-        parentToolUseId: wanted,
+        parentToolUseId: anchor,
         uuid: null, // 分叉锚点只在主链有效（同 getSessionHistory 对 sidechain 的处理）
       });
       for (const item of expanded) { total++; pushCapped(item); }
     }
   } catch {
-    return { ok: false, reason: 'read_failed' };
+    return null;
   } finally {
     input?.destroy();
   }
   const kept = items.slice(-limit);
+  return { kept, total };
+}
+
+// 子代理会话树：一次给全「这个会话里有哪些子代理」。scanSubagents 只服务后台任务横幅（身份+最近动作，
+// 不为 UI 导航设计），这里额外要 spawnDepth（父子层级）、finished、model 与消息数。
+export async function scanSubagentTree(sessionId, cwd, { baseDir = CLAUDE_DIR, metadataOnly = false } = {}) {
+  if (!isSafeSessionId(sessionId)) return []; // SS-003 同口径
+  const dir = join(baseDir, getProjectDir(cwd), sessionId, 'subagents');
+  let names;
+  try {
+    names = await readdir(dir);
+  } catch {
+    return []; // 目录不存在 = 这个会话没有子代理
+  }
+  const out = [];
+  for (const name of names) {
+    const m = /^agent-([0-9a-zA-Z_-]+)\.jsonl$/.exec(name);
+    if (!m) continue;
+    const agentId = m[1];
+    const meta = (await readSubagentMeta(dir, agentId)) ?? null;
+    const entry = {
+      agentId,
+      agentType: meta?.agentType ?? null,
+      description: meta?.description ?? null,
+      name: meta?.name ?? null,
+      toolUseId: meta?.toolUseId ?? null,
+      spawnDepth: meta?.spawnDepth ?? null,
+      finished: meta?.finished ?? null,
+      model: meta?.model ?? null,
+      messageCount: 0,
+      lastActivityMs: 0,
+    };
+    if (!metadataOnly) try {
+      const { fh, st } = await openRegularFile(join(dir, name));
+      // scanJsonl 会关闭 fh；它逐行回调，这里只数链条目（user/assistant），不保留正文。
+      try {
+        entry.lastActivityMs = st.mtimeMs;
+        await scanJsonl(fh, (e) => {
+          if (e.type !== 'user' && e.type !== 'assistant') return;
+          if (e.isMeta && coordinatorMessage(e) === null) return;
+          if (!e.message) return;
+          entry.messageCount += 1;
+        });
+      } catch {
+        await fh.close().catch(() => {});
+      }
+    } catch { /* 读失败（写入中/权限）：保留 meta 字段报出 */ }
+    out.push(entry);
+  }
+  // 层级优先、同级按活动时间：上层 agent 排前面，前端据此画树。
+  out.sort((a, b) => (a.spawnDepth ?? 1) - (b.spawnDepth ?? 1) || b.lastActivityMs - a.lastActivityMs);
+  return out;
+}
+
+// 把子代理的 transcript 转成一份【独立会话】，让现有的 resume / 聊天链路直接接管它。
+//
+// 【为什么是转写而不是 resume 子代理】CLI 的 resume 只认 projects/<slug>/<uuid>.jsonl 这一层，
+// 不认 subagents/ 子目录；SDK 也只给 listSubagents / getSubagentMessages（只读）。实测（claude 2.1.310 +
+// 本地 mock API）：把子代理条目重建成一棵独立会话后 resume，模型确实收到了子代理的 prompt 与结论原文。
+//
+// 【必须重建 parentUuid 链】子代理文件里的 parentUuid 有大量悬空引用（全库抽样 14584 条里 1279 条指向
+// 本文件里不存在的 uuid）——直接照抄会让 SDK 认为它们是断裂分支而整份过滤掉（实测 getSessionMessages 得 0 条）。
+// 这里按出现顺序重连成一条直线，并去掉 isSidechain / agentId（那是 sidechain 标记，留着就不是主链）。
+//
+// 【来源标记】每条加 ccmSubagentFork，记录出自哪个会话的哪个子代理。CLI 会原样保留未知字段（已实测
+// resume 不受影响），后续可以据此把这份"分身"和在原会话里的子代理对上号。
+export async function forkSubagentSession(sessionId, cwd, agentId, { baseDir = CLAUDE_DIR } = {}) {
+  if (!isSafeSessionId(sessionId)) return { ok: false, reason: 'bad_session' };
+  const wanted = typeof agentId === 'string' ? agentId.trim() : '';
+  if (!isSafeSessionId(wanted)) return { ok: false, reason: 'bad_agent_id' };
+  const dir = join(baseDir, getProjectDir(cwd), sessionId, 'subagents');
+  if (!(await subagentFlowExists(dir, wanted))) return { ok: false, reason: 'not_found' };
+  const meta = await readSubagentMeta(dir, wanted);
+
+  let raw;
+  try {
+    raw = await readRegularText(join(dir, `agent-${wanted}.jsonl`));
+  } catch {
+    return { ok: false, reason: 'read_failed' };
+  }
+  const chain = [];
+  for (const line of raw.split('\n')) {
+    if (!line.trim()) continue;
+    let entry;
+    try { entry = JSON.parse(line); } catch { continue; } // 写入中的尾行
+    if (entry.type !== 'user' && entry.type !== 'assistant') continue;
+    if (!entry.message) continue;
+    chain.push(entry);
+  }
+  if (chain.length === 0) return { ok: false, reason: 'empty' };
+
+  const newSessionId = randomUUID();
+  // 标记随每条消息落盘（不止首行）：列表只读头部窗口，而转写会话的头几条正是 user/assistant，
+  // 任何一条都能证明归属。agentType/description 一并写进去，列表就不必再回读 subagents/ 目录。
+  const forkTag = {
+    parentSessionId: sessionId,
+    agentId: wanted,
+  };
+  let prevUuid = null;
+  const lines = chain.map((entry) => {
+    const next = { ...entry, sessionId: newSessionId, cwd, parentUuid: prevUuid, ccmSubagentFork: forkTag };
+    const relayed = coordinatorMessage(entry);
+    if (relayed !== null) {
+      next.message = { ...next.message, content: relayed };
+      delete next.isMeta;
+      delete next.origin;
+    }
+    delete next.isSidechain;
+    delete next.agentId;
+    delete next.attributionAgent;
+    prevUuid = next.uuid;
+    return JSON.stringify(next);
+  });
+  try {
+    mkdirSync(join(baseDir, getProjectDir(cwd)), { recursive: true });
+    writeOwnerOnlyFile(join(baseDir, getProjectDir(cwd), `${newSessionId}.jsonl`), `${lines.join('\n')}\n`);
+  } catch (err) {
+    return { ok: false, reason: 'write_failed', error: err.message };
+  }
+  // 列表缓存按目录指纹失效，这里刚多了一个文件，不主动清会等到下一次指纹变化才看得见。
+  invalidateListCache(cwd);
   return {
     ok: true,
-    agentType: hit.agentType,
-    description: hit.description,
-    items: kept,
-    total,
-    truncated: total > kept.length,
+    sessionId: newSessionId,
+    agentId: wanted,
+    parentSessionId: sessionId,
+    agentType: meta?.agentType ?? null,
+    description: meta?.description ?? null,
+    entries: chain.length,
   };
 }

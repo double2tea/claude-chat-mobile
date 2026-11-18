@@ -7,10 +7,11 @@
 // 这份从原 history.test.mjs 拆出，同源的还有 -files、-list、-messages。
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { writeFileSync, mkdirSync, utimesSync, statSync } from 'node:fs';
+import { appendFileSync, writeFileSync, mkdirSync, utimesSync, statSync, readFileSync, readdirSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
-import { getProjectDir, getSessionHistory, HISTORY_MAX_MESSAGES, catchUpStep, externalHistoryExtent, historyTailKey, rebaselineAbsorbedExternal, classifyTranscriptTail, lastPermissionMode, readLastPermissionMode, lastAssistantModel, readLastAssistantModel, externalGrowthWhilePaused, appendedForeignWrite, scanSubagents, readSubagentFlow } from '../../app/src/sessions/history.js';
+import { observeSubagentRelay } from '../../app/src/sessions/history.js';
+import { getProjectDir, getSessionHistory, HISTORY_MAX_MESSAGES, catchUpStep, externalHistoryExtent, historyTailKey, rebaselineAbsorbedExternal, classifyTranscriptTail, lastPermissionMode, readLastPermissionMode, lastAssistantModel, readLastAssistantModel, externalGrowthWhilePaused, appendedForeignWrite, scanSubagents, readSubagentFlow, scanSubagentTree, forkSubagentSession } from '../../app/src/sessions/history.js';
 
 const BASE = join(tmpdir(), `ccm-hist-${process.pid}`);
 mkdirSync(BASE, { recursive: true });
@@ -1063,4 +1064,156 @@ test('externalHistoryExtent: 最后一条非己方写入的位置（1-based）�
 test('externalHistoryExtent: 缺 entrypoint（老 transcript）保守当外部写入', () => {
   // 与 catchUpStep 同一口径：不认识的来源当外部。多重载一次看得见，漏掉终端写入看不见。
   assert.equal(externalHistoryExtent([{ role: 'user', content: 'old' }, { role: 'assistant', content: 'x', entrypoint: 'sdk-ts' }]), 1);
+});
+
+// ---- 子代理会话树 / 按 agentId 读流水 / 独立聊天会话转写（2026-11-18）----
+// 手机端要能在普通聊天界面里看到子代理树、点进去读正文、并在子代理窗口单独继续聊——
+// 不经过任何 TUI。三条能力各自的边界都钉在这里：
+//   · 树：spawnDepth 决定层级顺序，finished/model 来自 meta，messageCount 只数链条目
+//   · 流水：agentId 入口必须与 toolUseId 入口同构（前端复用同一个渲染器），且同样挡住路径穿越
+//   · 转写：parentUuid 必须重连成直线、sidechain 标记必须清掉——否则 CLI 会整份丢弃（实测得 0 条）
+test.describe('subagent tree / flow by agentId / fork chat', () => {
+  function writeAgent(cwd, sid, agentId, { meta, entries }) {
+    const dir = join(BASE, getProjectDir(cwd), sid, 'subagents');
+    mkdirSync(dir, { recursive: true });
+    if (meta !== undefined) writeFileSync(join(dir, `agent-${agentId}.meta.json`), JSON.stringify(meta));
+    writeFileSync(join(dir, `agent-${agentId}.jsonl`), entries.map(e => JSON.stringify(e)).join('\n') + '\n');
+    return dir;
+  }
+
+  test('原位转达只承认本次指定调用、原代理新问答及主会话对应回报', async () => {
+    const cwd = '/relay-proof', sessionId = 'root', agentId = 'explorer', text = '同一个问题';
+    const projectDir = join(BASE, getProjectDir(cwd));
+    const childDir = writeAgent(cwd, sessionId, agentId, { entries: [] });
+    const file = join(projectDir, `${sessionId}.jsonl`);
+    const agentFile = join(childDir, `agent-${agentId}.jsonl`);
+    const question = { type: 'user', origin: { kind: 'coordinator' }, isMeta: true,
+      message: { content: `The coordinator sent a message while you were working:\n${text}\n\nAddress this before completing your current task.` } };
+    const answer = { type: 'assistant', message: { content: [{ type: 'text', text: '子代理答复' }] } };
+    const call = { type: 'assistant', message: { content: [{ type: 'tool_use', id: 'current-call', name: 'SendMessage', input: { to: agentId, message: text } }] } };
+    const report = tool => ({ type: 'user', origin: { kind: 'task-notification' },
+      message: { content: `<task-id>${agentId}</task-id>\n<tool-use-id>${tool}</tool-use-id>\n<status>completed</status>` } });
+    const append = (target, entries) => appendFileSync(target, entries.map(entry => JSON.stringify(entry)).join('\n') + '\n');
+    append(file, [call, report('current-call')]);
+    append(agentFile, [question, answer]);
+    const prompt = 'Relay request unique-id\n' + text;
+    const observe = await observeSubagentRelay(cwd, sessionId, agentId, text, { baseDir: BASE, prompt });
+    assert.deepEqual(await observe(), { confirmed: false, failed: false, routed: false });
+    append(file, [call, report('current-call')]);
+    assert.deepEqual(await observe(), { confirmed: false, failed: false, routed: false });
+    append(file, [{ type: 'user', origin: { kind: 'human' }, message: { content: prompt } }]);
+    append(file, [call, report('earlier-call')]);
+    assert.deepEqual(await observe(), { confirmed: false, failed: false, routed: true });
+    append(agentFile, [question, answer]);
+    assert.equal((await observe()).confirmed, false);
+    append(file, [report('current-call')]);
+    assert.equal((await observe()).confirmed, true);
+    const flow = await readSubagentFlow(sessionId, cwd, null, { baseDir: BASE, agentId });
+    assert.deepEqual(flow.items.slice(-2).map(entry => entry.content), [text, '子代理答复']);
+  });
+
+  test('scanSubagentTree：层级优先、同级按活动时间，带 finished/model/messageCount', async () => {
+    const cwd = '/test/satree';
+    const sid = 'satree-1';
+    writeAgent(cwd, sid, 'atop', { meta: { agentType: 'Explore', description: 'top level', toolUseId: 'toolu_t', spawnDepth: 1, finished: true, model: 'haiku' }, entries: [
+      { type: 'user', isSidechain: true, message: { role: 'user', content: 'go' } },
+      { type: 'assistant', isSidechain: true, message: { role: 'assistant', content: [{ type: 'text', text: 'done' }] } },
+    ] });
+    writeAgent(cwd, sid, 'anested', { meta: { agentType: 'general-purpose', spawnDepth: 2, finished: false }, entries: [
+      { type: 'assistant', isSidechain: true, message: { role: 'assistant', content: [{ type: 'text', text: 'nested' }] } },
+    ] });
+    const tree = await scanSubagentTree(sid, cwd, { baseDir: BASE });
+    assert.equal(tree.length, 2);
+    assert.equal(tree[0].agentId, 'atop', '深度 1 排前面（前端据此画父子层级）');
+    assert.equal(tree[0].spawnDepth, 1);
+    assert.equal(tree[0].finished, true);
+    assert.equal(tree[0].model, 'haiku');
+    assert.equal(tree[0].messageCount, 2, '只数 user/assistant 链条目');
+    assert.equal(tree[1].spawnDepth, 2);
+    assert.equal(tree[1].finished, false, 'meta.finished 原样透出，运行中的要能看出来');
+  });
+
+  test('scanSubagentTree：无 subagents 目录 → 空数组；非法 sessionId → 空数组', async () => {
+    assert.deepEqual(await scanSubagentTree('satree-none', '/test/satree-none', { baseDir: BASE }), []);
+    assert.deepEqual(await scanSubagentTree('../etc', '/test/satree-x', { baseDir: BASE }), []);
+  });
+
+  test('readSubagentFlow 按 agentId：与 toolUseId 入口同构，锚点回落到 agentId', async () => {
+    const cwd = '/test/saflow-agent';
+    writeAgent(cwd, 'saflow-agent-1', 'agx1', { meta: { agentType: 'Explore', description: 'scan', toolUseId: 'toolu_gx' }, entries: [
+      { type: 'user', isSidechain: true, timestamp: '2026-11-18T01:00:00.000Z', message: { role: 'user', content: '看看这个仓库' } },
+      { type: 'assistant', isSidechain: true, timestamp: '2026-11-18T01:00:05.000Z', message: { role: 'assistant', content: [{ type: 'tool_use', id: 't1', name: 'Read', input: { file_path: 'a.js' } }] } },
+      { type: 'user', isSidechain: true, timestamp: '2026-11-18T01:00:06.000Z', message: { role: 'user', content: [{ type: 'tool_result', tool_use_id: 't1', content: 'ok' }] } },
+    ] });
+    const r = await readSubagentFlow('saflow-agent-1', cwd, null, { baseDir: BASE, agentId: 'agx1' });
+    assert.equal(r.ok, true);
+    assert.equal(r.agentId, 'agx1');
+    assert.equal(r.agentType, 'Explore');
+    assert.equal(r.items.length, 3);
+    assert.equal(r.items[1].kind, 'tool_use');
+    assert.equal(r.items[2].kind, 'tool_result');
+    assert.ok(r.items.every(i => i.parentToolUseId === 'agx1'), '没有主链 toolUseId 时锚点用 agentId，前端仍能归组');
+  });
+
+  test('readSubagentFlow 按 agentId：不存在的 agent → not_found；穿越形态 → bad_agent_id', async () => {
+    const cwd = '/test/saflow-agent-miss';
+    writeAgent(cwd, 'saflow-agent-miss-1', 'areal', { meta: { agentType: 'x' }, entries: [
+      { type: 'assistant', message: { role: 'assistant', content: [{ type: 'text', text: 'x' }] } }] });
+    const miss = await readSubagentFlow('saflow-agent-miss-1', cwd, null, { baseDir: BASE, agentId: 'nothere' });
+    assert.equal(miss.ok, false);
+    assert.equal(miss.reason, 'not_found');
+    const escaped = await readSubagentFlow('saflow-agent-miss-1', cwd, null, { baseDir: BASE, agentId: '../../etc/passwd' });
+    assert.equal(escaped.ok, false);
+    assert.equal(escaped.reason, 'bad_agent_id');
+  });
+
+  test('forkSubagentSession：重连 parentUuid、清 sidechain 标记、写入独立会话文件', async () => {
+    const cwd = '/test/safork';
+    const sid = 'safork-1';
+    const dir = writeAgent(cwd, sid, 'afork', { meta: { agentType: 'Explore', description: 'fork me', toolUseId: 'toolu_f' }, entries: [
+      { type: 'user', isSidechain: true, uuid: 'u1', parentUuid: null, sessionId: sid, agentId: 'afork', message: { role: 'user', content: '原始任务' } },
+      // 故意给一个悬空 parentUuid：真实子代理文件里大量存在，照抄会让 CLI 把这段当断裂分支丢掉
+      { type: 'assistant', isSidechain: true, uuid: 'a1', parentUuid: 'dangling-uuid', sessionId: sid, agentId: 'afork', message: { role: 'assistant', content: [{ type: 'text', text: '结论' }] } },
+      { type: 'attachment', sessionId: sid, agentId: 'afork', attachment: { type: 'x' } },
+    ] });
+    assert.ok(dir);
+    const r = await forkSubagentSession(sid, cwd, 'afork', { baseDir: BASE });
+    assert.equal(r.ok, true);
+    assert.equal(r.agentId, 'afork');
+    assert.equal(r.parentSessionId, sid);
+    assert.equal(r.entries, 2, '只转写 user/assistant，attachment 之类不搬');
+    assert.match(r.sessionId, /^[0-9a-f-]{36}$/);
+
+    const written = readFileSync(join(BASE, getProjectDir(cwd), `${r.sessionId}.jsonl`), 'utf8').trim().split('\n').map(l => JSON.parse(l));
+    assert.equal(written.length, 2);
+    assert.equal(written[0].parentUuid, null, '首条无父节点');
+    assert.equal(written[1].parentUuid, 'u1', '悬空引用必须按出现顺序重连成直线');
+    assert.ok(written.every(e => e.sessionId === r.sessionId));
+    assert.ok(written.every(e => e.isSidechain === undefined), 'sidechain 标记留着就不是主链，CLI 会整份丢弃');
+    assert.ok(written.every(e => e.agentId === undefined));
+    assert.deepEqual(written[0].ccmSubagentFork, { parentSessionId: sid, agentId: 'afork' }, '来源标记：后续据此把分身与原会话里的子代理对上号');
+    assert.equal(written[1].ccmSubagentFork.agentId, 'afork');
+  });
+
+  test('forkSubagentSession：meta 损坏但流水完好 → 仍可单独聊天（agentType 回 null，不抛）', async () => {
+    const cwd = '/test/safork-badmeta';
+    const dir = join(BASE, getProjectDir(cwd), 'safork-badmeta-1', 'subagents');
+    mkdirSync(dir, { recursive: true });
+    writeFileSync(join(dir, 'agent-anometa.meta.json'), '{not json');
+    writeFileSync(join(dir, 'agent-anometa.jsonl'), JSON.stringify({ type: 'assistant', isSidechain: true, uuid: 'm1', agentId: 'anometa', sessionId: 'safork-badmeta-1', message: { role: 'assistant', content: [{ type: 'text', text: 'ok' }] } }) + '\n');
+    const r = await forkSubagentSession('safork-badmeta-1', cwd, 'anometa', { baseDir: BASE });
+    assert.equal(r.ok, true, '判存在看 jsonl 而不是 meta——meta 坏了不该连对话都开不了');
+    assert.equal(r.agentType, null);
+    assert.equal(r.description, null);
+  });
+
+  test('forkSubagentSession：不存在 / 穿越 / 空流水一律 ok:false，不落文件', async () => {
+    const cwd = '/test/safork-bad';
+    writeAgent(cwd, 'safork-bad-1', 'aempty', { meta: { agentType: 'x' }, entries: [] });
+    assert.equal((await forkSubagentSession('safork-bad-1', cwd, 'missing', { baseDir: BASE })).ok, false);
+    assert.equal((await forkSubagentSession('safork-bad-1', cwd, '../etc', { baseDir: BASE })).ok, false);
+    assert.equal((await forkSubagentSession('../other', cwd, 'aempty', { baseDir: BASE })).ok, false);
+    const created = readdirSync(join(BASE, getProjectDir(cwd))).filter(n => n.endsWith('.jsonl'));
+    assert.deepEqual(created, [], '失败的调用不得在项目目录留下半份会话文件');
+  });
 });

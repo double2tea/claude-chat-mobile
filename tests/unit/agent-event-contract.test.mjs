@@ -373,7 +373,10 @@ test('INBOUND_SOCKET_EVENTS 与 interfaces.md 的入向事件表同源（数量�
   //      + logs:clientPerf（2026-11-01，前端性能记录攒批上报，落成 ccm-server.log 的 [client-perf] 行，scripts/perf-report.js
   //        按维度出分位值。不并进 logs:clientError：那条一次一个错误、给人读；这条是结构化批次、给统计读，清洗口径也不同。
   //        fire-and-forget、无回执，所以进 MOCK_INBOUND_EXEMPT。入向 74→75）
-  assert.equal(INBOUND_SOCKET_EVENTS.length, 75);
+  //      + subagent:tree / subagent:fork_chat / subagent:continue（2026-11-18，子代理会话树与续聊）。
+  //        不并进 subagent:flow：那条按需读一个 agent 的正文（单文件可达 1.2MB），列表只需要 meta + 消息数；
+  //        fork_chat 要落一份新会话文件，权限档与只读的 flow 不同。入向 75→78。
+  assert.equal(INBOUND_SOCKET_EVENTS.length, 78);
   assert.ok(INBOUND_SOCKET_EVENTS.includes('logs:clientPerf'));
   assert.ok(INBOUND_SOCKET_EVENTS.includes('folders:recheck'));
   assert.ok(INBOUND_SOCKET_EVENTS.includes('folders:removeMissing'));
@@ -396,6 +399,9 @@ test('INBOUND_SOCKET_EVENTS 与 interfaces.md 的入向事件表同源（数量�
   assert.ok(INBOUND_SOCKET_EVENTS.includes('session:rewind:confirm'));
   assert.ok(INBOUND_SOCKET_EVENTS.includes('user:renameTrustedDevice'));
   assert.ok(INBOUND_SOCKET_EVENTS.includes('subagent:flow'));
+  assert.ok(INBOUND_SOCKET_EVENTS.includes('subagent:tree'));
+  assert.ok(INBOUND_SOCKET_EVENTS.includes('subagent:fork_chat'));
+  assert.ok(INBOUND_SOCKET_EVENTS.includes('subagent:continue'));
   assert.ok(INBOUND_SOCKET_EVENTS.includes('user:revokeTrustedDevice'));
   assert.ok(INBOUND_SOCKET_EVENTS.includes('task:output'));
   assert.ok(INBOUND_SOCKET_EVENTS.includes('attachment:read'));

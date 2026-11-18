@@ -92,6 +92,35 @@ test('SDK 快路径: 字段映射 id/title/lastUsedAt，dir 传原始 cwd，不�
   }
 });
 
+test('SDK 列表保留续聊自己的标题和旧子代理的来源', async () => {
+  const cwd = '/sdk/subagent-lineage';
+  const dir = join(CLAUDE_DIR, getProjectDir(cwd));
+  const subagents = join(dir, 'parent-session', 'subagents');
+  writeJSONL(dir, 'child-session', [{
+    type: 'user',
+    message: { role: 'user', content: 'Original prompt' },
+    ccmSubagentFork: { parentSessionId: 'parent-session', agentId: 'child-agent' },
+  }]);
+  mkdirSync(subagents, { recursive: true });
+  writeFileSync(join(subagents, 'agent-child-agent.meta.json'), JSON.stringify({
+    agentType: 'Explore', description: 'Review production status',
+  }));
+  __setSdkListSessionsForTest(async () => [
+    { sessionId: 'child-session', summary: 'Follow-up prompt', lastModified: 1784098212405 },
+  ]);
+  try {
+    const { sessions: [row] } = await listSessionsPage(cwd);
+    assert.equal(row.title, 'Follow-up prompt');
+    assert.deepEqual(row.forkOrigin, {
+      parentSessionId: 'parent-session', agentId: 'child-agent', agentType: 'Explore',
+      description: 'Review production status',
+    });
+  } finally {
+    __setSdkListSessionsForTest(undefined);
+    rmProjectDir(dir);
+  }
+});
+
 test('SDK 快路径: 重排后 hasMore——候选多于 limit 为 true；恰好等于则 false', async () => {
   const cwd = '/sdk/hasmore';
   const dir = join(CLAUDE_DIR, getProjectDir(cwd));

@@ -133,6 +133,16 @@
         </svg>
       </button>
 
+      <!-- 子代理会话树：会话里有子代理时才出现（数量角标由 app.js 同步）。
+           走服务端 subagent:tree/flow，不弹终端——手机上直接看子代理对话、并可在此继续对话。 -->
+      <button id="btnSubagents" type="button" class="hidden hit-44-tight w-9 h-9 flex items-center justify-center rounded-xl text-ink-soft hover:bg-sunk active:scale-95 transition-all select-none border border-line-soft bg-surface shadow-sm relative" title="子代理会话" aria-label="子代理会话">
+        <svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke-width="2" stroke="currentColor" class="w-5 h-5" aria-hidden="true">
+          <path stroke-linecap="round" stroke-linejoin="round" d="M7.5 4.5h9M7.5 19.5h9M4.5 7.5v9M19.5 7.5v9" />
+          <circle cx="12" cy="12" r="2.25" stroke-linecap="round" />
+        </svg>
+        <span id="subagentCount" class="hidden absolute -top-1 -right-1 min-w-[15px] h-[15px] px-1 rounded-full bg-cta text-white text-[9px] font-bold leading-[15px] text-center tabular-nums"></span>
+      </button>
+
       <!-- 新会话 ＋：与 home/日志同材质 -->
       <button id="btnNew" class="hit-44-tight w-9 h-9 flex items-center justify-center rounded-xl text-ink-soft hover:bg-sunk active:scale-95 transition-all select-none border border-line-soft bg-surface shadow-sm" title="创建新会话" aria-label="创建新会话">
         <svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke-width="2.2" stroke="currentColor" class="w-5 h-5">
@@ -229,6 +239,12 @@
   <!-- #379：回合两端的读屏播报。流式气泡与秒表行都不挂 live（高频重写会刷屏），但读屏用户仍要知道
        「开始回了」「回完了 / 出错 / 中止」——只在这两个端点各写一次，中间过程不进 live region。 -->
   <div id="turnAnnouncer" class="sr-only" role="status" data-testid="turn-announcer"></div>
+
+  <!-- 从子代理窗口接着聊之后，这条提示把人送回去：新会话在侧栏里是一条独立会话，
+       没有它就只能靠回忆自己刚才从哪儿来。不放进 #messages——那里会被切会话清屏。 -->
+  <div id="subagentReturnBar" class="hidden shrink-0 items-center gap-2 px-3 py-1.5 text-xs bg-accent-wash/40 border-b border-accent/20" role="status" data-testid="subagent-return-bar">
+    <button type="button" id="subagentReturnBtn" class="font-semibold text-accent">← <span id="subagentReturnLabel">返回主会话</span></button>
+  </div>
 
   <!-- 回到最新（#376）：上翻离开底部时出现；与未读胶囊分层（清除条件不同），左下角相对 #composerFooter 顶定位。
        点击 force 落底；有新增顶层气泡时文案变为「N 条新内容」。
@@ -406,6 +422,8 @@
         <span class="font-semibold block">重新加载本会话</span>
         <span class="text-xs text-ink-soft">重新拉取这个会话的历史消息，不刷新整页</span>
       </button>
+      <button id="moreHome" type="button" class="header-overflow-action mt-2 w-full text-left p-2.5 rounded-xl border border-line bg-surface active:bg-sunk text-sm text-ink">回首页</button>
+      <button id="moreConsole" type="button" class="header-overflow-action mt-2 w-full text-left p-2.5 rounded-xl border border-line bg-surface active:bg-sunk text-sm text-ink">查看会话日志</button>
       <button id="moreCancel" type="button" class="mt-3 w-full py-2.5 rounded-lg border border-line text-ink active:bg-sunk font-medium">取消</button>
     </div>
   </div>

@@ -182,6 +182,7 @@ import { createSheetController } from './app/sheets.js';
 import { createDrawerController } from './app/drawer.js';
 import { createSessionDeleteController } from './app/session-delete.js';
 import { createSessionRowMenu } from './app/session-row-menu.js';
+import { createSubagentView } from './app/subagent-view.js';
 import { createElicitationSheet } from './app/elicitation-sheet.js';
 import { createForegroundTasks } from './app/foreground-tasks.js';
 import { createSessionRenameController } from './app/session-rename.js';
@@ -393,6 +394,12 @@ import { createKeyboardInset } from './app/keyboard-inset.js';
 
   // ---- 状态 ----
   let currentSessionId = localStorage.getItem('current_session') || null;
+  // 子代理视窗句柄。卡片的入口在 createSubagentView 之前就可能被调用（历史/实时卡片），
+  // 所以先留一个晚绑定的引用，创建后填上；未就绪时点击不做事，而不是抱 TDZ 错误。
+  let subagentViewRef = null;
+  // 从子代理窗口「接着聊」时记下的来路：{ sessionId, cwd }。独立会话顶部的那条返回提示读它，
+  // 回到原会话或换到无关会话时清掉。
+  let subagentReturnTarget = null;
   // 按表面分槽的未发送草稿 {text, attachments}（切走存/切回恢复；同一表面静默换实例不读写，见 planSessionDraftSwap）。
   // 槽的 key 见 draftKeyFor：有 sessionId 用它，新会话页（首发前无 id）用 `new:<cwd>`。
   // 仅内存、不落盘——刷新页面后丢失可接受（与 sessionDomCache 同寿）。
@@ -3270,6 +3277,7 @@ import { createKeyboardInset } from './app/keyboard-inset.js';
             </div>
             <div class="sa-lasttool mt-0.5 pl-5 text-ink-faint truncate hidden" data-testid="subagent-last-tool"></div>
           </summary>
+          <div class="sa-actions px-3 pb-1"><button type="button" class="sa-open-btn" data-testid="subagent-open">${t('查看 / 独立对话')}</button></div>
           <div class="t-in mx-3 mb-1 text-ink-soft break-words hidden"></div>
           <div class="t-full-host px-3 pb-1 space-y-1">
             <pre class="t-out overflow-x-auto whitespace-pre-wrap break-words text-ink-faint hidden"><code></code></pre>
@@ -3292,6 +3300,14 @@ import { createKeyboardInset } from './app/keyboard-inset.js';
         thinkings: new Map(),
       };
       renderSubagentTitle(c);
+      // 卡片直达子代理窗口：只带 toolUseId，agentId 由服务端按 meta 反查。
+      // summary 里的按钮要拦掉默认 toggle，否则点它会连折叠卡一起开合。
+      wrap.querySelector('.sa-open-btn')?.addEventListener('click', event => {
+        event.preventDefault();
+        event.stopPropagation();
+        haptic('tap');
+        subagentViewRef?.openByToolUseId(parentId, { agentType: c.type });
+      });
       subagentCards.set(parentId, c);
       appendMessage(wrap);
       scrollBottom();
@@ -4960,6 +4976,11 @@ import { createKeyboardInset } from './app/keyboard-inset.js';
     syncComposerVisibility();
     syncTopContextPillVisibility(id, sid);
     if (sid) unread.markEntered(sid); // R65：入场即记已读 + 手动未读作废（离场侧 markSeen 另有一记，两侧合围）
+    // 子代理入口跟着视图走：切到没有子代理的会话就收起，避免点进去是空面板。
+    // 只读一次目录扫描（服务端 readdir + meta），失败按 0 处理，不挡会话渲染。
+    if (sid) subagentViewRef?.refreshCount(); else subagentViewRef?.clear?.();
+    // 返回提示只在「子代理独立会话」里出现；切到别的会话就收起，免得在无关对话上留一条回去的按钮。
+    if (subagentReturnTarget) showSubagentReturnBar(subagentReturnTarget.forkedSessionId);
 
     // Phase 2: Check memory cache for instant restoration.
     // 已完成的对话/工具卡片按 session 不可变：同 sessionId 即恢复 DOM，不要求 instanceId 相同
@@ -5608,6 +5629,7 @@ import { createKeyboardInset } from './app/keyboard-inset.js';
     renderHooksBridgeSection, renderStatuslineBridgeSection, SESSION_PANEL_REVALIDATE_MS, sessionPanel,
     sessionRename, sessionRowMenu, sessionsCache, sessionsDot, sessionSearchQueryByDir, sessionWorkspaceState,
     setStatusIcon, showSessionBlockedSurface: (...args) => showSessionBlockedSurface(...args), socket,
+    openSubagent: (agent, target) => subagentViewRef?.openAgent(agent, target),
     syncDashNoFolders: (...args) => syncDashNoFolders(...args), unread,
     getAvailableDirs: () => availableDirs, getCurrentCwd: () => currentCwd,
     getDirSectionNodes: () => dirSectionNodes, getDisplayedSessionId: () => displayedSessionId,
@@ -6085,6 +6107,59 @@ import { createKeyboardInset } from './app/keyboard-inset.js';
     openSheet(moreModal);
   });
   $('moreReloadSession')?.addEventListener('click', () => { closeMoreMenu(); reloadSessionByHand(); });
+  $('moreHome')?.addEventListener('click', () => { closeMoreMenu(); btnHome?.click(); });
+  $('moreConsole')?.addEventListener('click', () => { closeMoreMenu(); btnConsole?.click(); });
+
+  // 子代理会话树 / 独立视窗：只走服务端 subagent:*，不弹终端。
+  // scope 取「正在看的那条会话」的驾驶 cwd——服务端按它找 transcript 与 subagents/ 目录。
+  const subagentView = createSubagentView({
+    socket,
+    getScope: () => ({ cwd: drivingCwdOf(displayedInstanceId) || currentCwd, sessionId: displayedSessionId }),
+    onCountChange: count => {
+      const btn = $('btnSubagents');
+      const badge = $('subagentCount');
+      if (!btn) return;
+      btn.classList.toggle('hidden', !count);
+      if (badge) {
+        badge.textContent = String(count);
+        badge.classList.toggle('hidden', !count);
+      }
+    },
+    onForkSent: ({ sessionId, cwd, parentSessionId }) => {
+      subagentReturnTarget = {
+        sessionId: parentSessionId,
+        cwd,
+        forkedSessionId: sessionId,
+      };
+      showSubagentReturnBar(sessionId);
+    },
+  });
+  $('btnSubagents')?.addEventListener('click', () => { haptic('tap'); subagentView.openTree(); });
+  subagentViewRef = subagentView;
+
+  // 子代理独立会话顶部的返回条：只在「从子代理窗口接着聊」出来的那条会话里显示，
+  // 回到原会话、或用户自己切到别处时收起。
+  function showSubagentReturnBar(forkedSessionId) {
+    const bar = $('subagentReturnBar');
+    if (!bar || !subagentReturnTarget) return;
+    const label = $('subagentReturnLabel');
+    if (label) label.textContent = t('返回主会话');
+    bar.classList.toggle('hidden', displayedSessionId !== forkedSessionId);
+    bar.classList.toggle('flex', displayedSessionId === forkedSessionId);
+  }
+  function hideSubagentReturnBar() {
+    $('subagentReturnBar')?.classList.add('hidden');
+    $('subagentReturnBar')?.classList.remove('flex');
+  }
+  $('subagentReturnBtn')?.addEventListener('click', () => {
+    if (!subagentReturnTarget?.sessionId) return hideSubagentReturnBar();
+    haptic('tap');
+    const target = subagentReturnTarget;
+    hideSubagentReturnBar();
+    socket.emit('session:switch', { sessionId: target.sessionId, cwd: target.cwd }, res => {
+      if (!res?.ok) { addBar(res?.error || t('切换失败'), 'text-danger'); showSubagentReturnBar(target.forkedSessionId); }
+    });
+  });
   $('moreCancel')?.addEventListener('click', closeMoreMenu);
   moreModal?.addEventListener('click', e => { if (e.target === moreModal) closeMoreMenu(); });
   moreModal?.addEventListener('keydown', e => { if (e.key === 'Escape') closeMoreMenu(); });
@@ -6153,6 +6228,7 @@ import { createKeyboardInset } from './app/keyboard-inset.js';
             </div>
             <div class="sa-lasttool mt-0.5 pl-5 text-ink-faint truncate hidden" data-testid="subagent-last-tool"></div>
           </summary>
+          <div class="sa-actions px-3 pb-1"><button type="button" class="sa-open-btn" data-testid="subagent-open">${t('查看 / 独立对话')}</button></div>
           <div class="t-in mx-3 mb-1 text-ink-soft break-words hidden"></div>
           <div class="t-full-host px-3 pb-1 space-y-1">
             <pre class="t-out overflow-x-auto whitespace-pre-wrap break-words text-ink-faint hidden"><code></code></pre>

@@ -3,8 +3,9 @@
 // #359 Step 4 从 app.js 原样迁出；只有本模块用的几份状态（显示更多档位、终端聚合态、保鲜计时器、未读跳转）随代码搬入，
 // 与 app.js 共用的可变态经 getter / setter 注入，声明在实例化点之后的依赖经惰性包装注入。
 
-import { MISSING_FOLDERS_NOTICE_ID, disconnectFolderConfirm, displaySessionTitle, esc, folderReasonText, folderRowMenuItems, formatServiceNoticeRows, formatSessionRowSubtitle, formatSessionRowTime, liveRowsForSection, mergeOrphanRowsByTime, openSessionsUnderRoot, orphanLiveRows, remainingOlderSessionCount, resolveDrawerStatus, resolveDrawerStatusChip, resolveHeaderAttentionChip, resolveHeaderConnBadge, resolveRowTerminalState, sessionRowMenuItems, shouldRerenderSessionList, summarizeOtherWorkspaces, undismissedServiceNotices, unownedLiveInstances, whatNeedsAttention } from '../logic.js';
+import { MISSING_FOLDERS_NOTICE_ID, disconnectFolderConfirm, displaySessionTitle, esc, folderReasonText, folderRowMenuItems, formatServiceNoticeRows, formatSessionRowSubtitle, formatSessionRowTime, groupSubagentForks, liveRowsForSection, mergeOrphanRowsByTime, openSessionsUnderRoot, orphanLiveRows, remainingOlderSessionCount, resolveDrawerStatus, resolveDrawerStatusChip, resolveHeaderAttentionChip, resolveHeaderConnBadge, resolveRowTerminalState, sessionRowMenuItems, shouldRerenderSessionList, summarizeOtherWorkspaces, undismissedServiceNotices, unownedLiveInstances, whatNeedsAttention } from '../logic.js';
 import { attachFolderDrag } from './folder-drag.js';
+import { groupAgentContinuations } from '../logic/panel-state.js';
 import { bindSessionRowsHost, bindSessionSearchInput } from './session-search.js';
 import { createDrawerUnreadJump } from './drawer-unread-jump.js';
 import { createLastKnownExpiry } from './terminal-state-expiry.js';
@@ -24,11 +25,13 @@ export function createSessionSidebar(context, {
   getViewingInstanceId, getWorkdirStates, setComposeCwd, setCurrentCwd, setDirSectionNodes,
   setDisplayedSessionId, setExplicitCloseInstanceId, setFreshInterruptedInstanceId, setLatestServiceHealth,
   setSessionIdClearedByNav, setViewingInstanceId,
+  openSubagent,
 } = {}) {
   // 目录 → 「显示更多」点了几次（照抄桌面端 Show more，每次多显示一档；「收起」回到 0 即删键）。缓存里的 sessions
   // 是"当下拿到的那一份"，记不住用户要看更多这个意图——而 populateSubtree 每次都会无条件 revalidate，
   // 不带上 more 就会把展开态悄悄打回第一档（P0-11x）。
   const moreStepsByDir = new Map();
+  const collapsedSubagents = new Set();
   // session:list 附带的 CLI registry 快照：每个 cwd 的终端聚合态（'waiting' | 'busy'，无则不存键）。
   // 与 Web workdirStates 独立保存并在抽屉显示层合并，避免 live idle/done 遮住终端运行态。
   // 存单值而后端给两个布尔：目录行只有一个角标位，同 cwd 两态并存时取更要紧的那个（等人 > 在跑）。
@@ -425,22 +428,30 @@ export function createSessionSidebar(context, {
 
   // 统一行：一条会话（session:list 的 s，或无 id 的新会话）→ DOM 行。liveInst 非空 = 已打开为 tab。
   // 全程 textContent（无 innerHTML 插值用户数据）→ CSP 安全。
-  const sessionRow = (s, liveInst, workspaceCwd) => {
+  const sessionRow = (s, liveInst, workspaceCwd, { nested = false } = {}) => {
     // 托管 worktree 的会话行自带真实 cwd（`.claude/worktrees/<name>`，父仓只是展示归属）。
     // 打开/删除都要用它：拿工作区 cwd 去 resume，会落到一个根本没有这条 transcript 的
     // project 目录，ack 回「会话不存在」。父仓的行不带 cwd，照旧回落工作区 cwd。
     const rowCwd = s.cwd || workspaceCwd;
     const active = liveInst && liveInst.instanceId === getViewingInstanceId();
 
-    const rowContent = el(`<div class="row-content relative flex items-center gap-2 pl-6 pr-3 py-2.5 border-b border-line-soft cursor-pointer select-none${active ? ' bg-accent-wash' : ' bg-surface'}" data-testid="session-row" data-session-id="${esc(s.id || '')}" data-instance-id="${esc(liveInst?.instanceId || '')}"></div>`);
+    // nested：挂在父会话下面的子代理行。缩进 + 左侧细线表达层级，行高略矮，避免一条主会话被
+    // 三四个子代理撑成一大块；点击行为与普通会话完全一致（它确实是一条能 resume 的会话）。
+    const rowContent = el(`<div class="row-content relative flex items-center gap-2 ${nested ? 'pl-3 pr-3 py-2' : 'pl-6 pr-3 py-2.5'} border-b border-line-soft cursor-pointer select-none${active ? ' bg-accent-wash' : ' bg-surface'}${nested ? ' session-fork-row' : ''}" data-testid="session-row" data-session-id="${esc(s.id || '')}" data-instance-id="${esc(liveInst?.instanceId || '')}"${nested ? ' data-subagent-fork="1"' : ''}></div>`);
     rowContent.dataset.terminalState = s.terminal || '';
     rowContent.dataset.terminalSource = s.terminalSource || '';
     rowContent.dataset.bgLocked = s.bgLocked ? '1' : '';
     const btn = el(`<button class="flex-1 min-w-0 text-left text-xs active:opacity-70"></button>`);
-    btn.title = displaySessionTitle(s.title, t('新会话'));
+    const rowTitle = displaySessionTitle(s.title, t('新会话'));
+    btn.title = rowTitle;
     const head = el(`<div data-session-head class="flex items-center gap-1.5 min-w-0"></div>`);
+    if (s.forkOrigin) {
+      const owner = el('<span class="session-fork-label shrink-0"></span>');
+      owner.textContent = t('续聊');
+      head.appendChild(owner);
+    }
     const titleSpan = el(`<span class="flex-1 min-w-0 truncate font-medium${active ? ' text-accent' : ' text-ink-soft'}"></span>`);
-    titleSpan.textContent = displaySessionTitle(s.title, t('新会话'));
+    titleSpan.textContent = rowTitle;
     head.appendChild(titleSpan);
     // R65 未读：标题加粗变深 + 文字 chip「未读」（原 8px 色点在手机上既不显眼也说不清自己是什么）。
     // 上次打开后有新活动或在「⋯」菜单里标过才亮；正在看的（本实例激活或就是当前显示会话）不算未读。
@@ -776,7 +787,7 @@ export function createSessionSidebar(context, {
         const rowsHost = bindSessionRowsHost(container, el);
         rowsHost.innerHTML = '';
 
-        let orphans = [];
+        let orphans;
         if (!query) {
           for (const inst of freshTabs) {
             rowsHost.appendChild(sessionRow({ id: null, title: inst.title, lastUsedAt: null, entrypoint: null }, inst, cwd));
@@ -790,10 +801,67 @@ export function createSessionSidebar(context, {
           const openById = new Map(open.map(s => [s.id, s]));
           orphans = orphanLiveRows(liveMap, listedIds)
             .map(inst => openById.get(inst.sessionId) || { id: inst.sessionId, title: inst.title, lastUsedAt: null, entrypoint: null });
+          const orphanIds = new Set(orphans.map(row => row.id));
+          orphans.push(...open.filter(row => !listedIds.has(row.id) && !orphanIds.has(row.id)));
+        } else {
+          orphans = open;
         }
-        for (const s of mergeOrphanRowsByTime(sessions, orphans)) {
-          rowsHost.appendChild(sessionRow(s, liveMap.get(s.id), cwd));
-        }
+        const listed = mergeOrphanRowsByTime(sessions, orphans);
+        const pinnedOnly = pinned.filter(row => !listed.some(item => item.id === row.id));
+        const { roots, children } = groupSubagentForks([...listed, ...pinnedOnly]);
+        const pinnedIds = new Set(pinnedOnly.map(row => row.id));
+        const matches = new Set(sessions.map(row => row.id));
+        const renderBranch = (s, target, nested = false) => {
+          const forks = children.get(s.id) || [];
+          const groups = groupAgentContinuations(s.subagents, forks, !query || matches.has(s.id));
+          const row = sessionRow(s, liveMap.get(s.id), cwd, { nested });
+          if (!groups.size) {
+            target.appendChild(row);
+            return;
+          }
+          const family = el('<div data-testid="session-family"></div>');
+          target.appendChild(family);
+          family.appendChild(row);
+          const host = el(`<details class="sa-forks" data-testid="session-subagent-forks"></details>`);
+          host.open = Boolean(query) || !collapsedSubagents.has(s.id);
+          host.addEventListener('toggle', () => {
+            if (query || !host.isConnected) return;
+            if (host.open) collapsedSubagents.delete(s.id);
+            else collapsedSubagents.add(s.id);
+          });
+          const summary = el('<summary class="session-subagent-summary"></summary>');
+          summary.textContent = `${t('子代理会话')} · ${groups.size}`;
+          host.appendChild(summary);
+          for (const { agent, hasTranscript, continuations } of groups.values()) {
+            const branch = el('<div class="session-agent-branch" data-testid="session-agent-branch"></div>');
+            const link = hasTranscript
+              ? el('<button type="button" class="session-subagent-link" data-testid="session-subagent-link"></button>')
+              : el('<div class="session-subagent-link"></div>');
+            const name = el('<span class="session-agent-name"></span>');
+            name.textContent = agent.name || agent.agentType || t('子代理会话项');
+            link.appendChild(name);
+            if (agent.description && agent.description !== name.textContent) {
+              const caption = el('<span class="session-agent-description"></span>');
+              caption.textContent = agent.description;
+              link.appendChild(caption);
+            }
+            if (hasTranscript) {
+              link.onclick = () => {
+                closeLeftSidebar();
+                openSubagent(agent, { cwd: s.cwd || cwd, sessionId: s.id });
+              };
+            }
+            branch.appendChild(link);
+            if (continuations.length) {
+              const list = el('<div class="session-agent-continuations"></div>');
+              for (const continuation of continuations) renderBranch(continuation, list, true);
+              branch.appendChild(list);
+            }
+            host.appendChild(branch);
+          }
+          family.appendChild(host);
+        };
+        for (const s of roots) if (!pinnedIds.has(s.id)) renderBranch(s, rowsHost);
         if (query && sessions.length === 0) {
           const empty = el(`<div class="pl-6 pr-3 py-3 text-xs text-ink-faint border-b border-line-soft/40" data-testid="session-search-empty">${t('无匹配会话')}</div>`);
           rowsHost.appendChild(empty);
@@ -837,13 +905,12 @@ export function createSessionSidebar(context, {
         // 手动标「稍后再看」、已被 limit 挤出时间序这一页的会话（服务端 session:list 的 pinned）。按时间它们
         // 都比本页更早，所以排在本页与「显示更多」之后（O81：此前置顶，读起来像排序坏了；显示到覆盖它的那一档时，
         // 服务端不再把它算进 pinned，它就落回时间序里）。带一行小标说明这一组为什么在这里。
-        if (!query && pinned.length) {
+        const pinnedRoots = roots.filter(row => pinnedIds.has(row.id));
+        if (!query && pinnedRoots.length) {
           const pinnedHead = el(`<div class="pl-6 pr-3 pt-2 pb-1 text-[10px] uppercase tracking-wide text-ink-faint" data-testid="session-pinned-head"></div>`);
           pinnedHead.textContent = t('稍后再看');
           rowsHost.appendChild(pinnedHead);
-          for (const s of pinned) {
-            rowsHost.appendChild(sessionRow(s, liveMap.get(s.id), cwd));
-          }
+          for (const s of pinnedRoots) renderBranch(s, rowsHost);
         }
         refreshDirUnreadCounts(); // 行数据（含 lastUsedAt）刚更新，目录头「N 未读」随之重算
         // 折叠态点角标 → 先展开、发 session:list、等 ack 回来渲染完行，跳转才有落点，就是这里。
